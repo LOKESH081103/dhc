@@ -1,0 +1,25 @@
+flowchart TD
+    A["dcr_tab\n(every enriched receipt this period)"] --> B{"Mode == 'AIRTEL / CASH' ?"}
+    B -- No --> Z1["Excluded\n(RTGS / Cheque-DD / Online receipts\nare never checked here)"]
+    B -- Yes --> C{"Ag Level cash mode\nis filled? OR\nCIF LEVEL is filled?"}
+
+    subgraph SRC["Where those two flags come from"]
+        D1["To_be_Disabled.xlsb\n'Agreement Level Disble' sheet"] -->|"matched on AGREEMENTNO"| D3["Ag Level cash mode"]
+        D2["To_be_Disabled.xlsb\n'CIF Level Disable' sheet"] -->|"matched on CIF"| D4["CIF LEVEL"]
+    end
+    D3 -.merged into dcr_tab.-> C
+    D4 -.merged into dcr_tab.-> C
+
+    C -- "Both blank" --> Z2["Excluded\n(cash payment was allowed)"]
+    C -- "Either filled" --> E["FLAGGED transaction\n= a cash receipt from an\nagreement/CIF that should\nhave been blocked"]
+
+    E --> F["Group flagged rows by:\nCIF + Zone + Sub Region + Slab"]
+    F --> G["Pivot: one column per\nReceipt Date, cell = sum(AMOUNTPAID)\nfor that entity on that date"]
+    G --> H["Add 'Grand Total' column\n= sum across all date columns"]
+    H --> I["Final table: 1 ROW per unique\nCIF+Zone+Sub Region+Slab combo\nthat had ≥1 flagged cash payment"]
+
+    I --> J["UI badge:\n'⚠️ N Violations Found'\nN = number of ROWS\n(len of this table)"]
+
+    style E fill:#f8d7da,stroke:#c0392b
+    style I fill:#fff3cd,stroke:#e6a817
+    style J fill:#d4edda,stroke:#27ae60
