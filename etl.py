@@ -1,618 +1,279 @@
 """
-DHC Working automation — core ETL pipeline.
+Cash / Cheque / DD — TAT Validation.
 
-Replicates, in pandas, the manual VLOOKUP/COUNTIFS/pivot workflow found inside
-DHC_Working_-_Jun_26.xlsx. See ROADMAP.md for the full reverse-engineered logic
-map and the open questions that need confirming with the process owner.
+Standalone project, separate from the main DHC Working Automation app.
+Same DCR source file, but a narrower job: flag CASH receipts not
+deposited (seal challan uploaded) within 1 working day, and CHEQUE/DD
+receipts not deposited within 3 working days.
+
+PENDING DAYS = "Date" (column A, the report date) − "RECEIPT ENTER
+DATE" (column E), both taken as calendar dates (time-of-day ignored).
+This is a plain calendar-day count (no weekend/holiday skipping).
+
+DATE PARSING NOTE: the file is read with engine="pyxlsb", and pyxlsb
+cannot distinguish an Excel date cell from a plain number (pandas'
+pyxlsb reader hands back the raw serial number either way). So "Date"
+and "RECEIPT ENTER DATE" arrive here as numbers like 46213, not
+datetimes. _parse_dates() below converts those serials back to real
+dates (Excel's day-zero is 1899-12-30). It also transparently handles
+the case where a column instead comes through as text like
+"03-Jul-26" (dayfirst), so this keeps working if the reader ever
+changes.
 """
-import io
-import numpy as np
+import html
+import re
+from datetime import datetime
+
 import pandas as pd
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
 
-# ---------------------------------------------------------------------------
-# Static mapping tables copied verbatim from the workbook's "Sheet3" tab.
-# These are the small reference tables mam's VLOOKUPs point at.
-# ---------------------------------------------------------------------------
-MODE_MAP = {
-    "AIRTEL": "AIRTEL / CASH", "CASH": "AIRTEL / CASH",
-    "CHEQUE": "CHQ / DD", "DD": "CHQ / DD",
-    "ONLINE_PAYMENT": "ONLINE_PAYMENT", "RTGS": "RTGS",
+MODE_TAT = {"Cash": 1, "Cheque": 3, "DD": 3}
+MODE_MATCH = {
+    "Cash": ["CASH"],
+    "Cheque": ["CHEQUE", "CHQ"],
+    "DD": ["DD"],
 }
-STATUS_MAP = {"B": "Bounced", "C": "Cleared", "D": "Deposit", "NA": "Pending", "X": "Cxn"}
-RECEIPT_SOURCE_MAP = {
-    "BBPS": "BBPS", "CHOLAONE DIRECT": "CHOLAONE DIRECT",
-    "CCP - BITLY": "CCP - BITLY", "CCP - QR": "CCP - QR", "CCP": "CCP - QR",
-}
-RECEIPT_TYPE_MAP = {
-    "Part Payment": "Part Payment", "FC": "Settlement",
-    "Sale/EMD receipt": "Settlement", "Settlement": "Settlement", "OD": "OD",
-}
-RECEIPT_TYPE_FALLBACK = {"OD": "OD", "OTHER OD": "OTHER OD"}
 
-
-EXCEL_DATE_COLUMNS = [
-    "Date", "TXN DATE IN PL TAB", "RECEIPT ENTER DATE",
-    "RECEIPTENTEREDTIME", "VALUEDATE", "TXNDATE",
+# (display column name in the output/mail table, candidate raw-file column names to look for)
+OUTPUT_COLUMNS = [
+    ("RECEIPT ENTER DATE", ["RECEIPT ENTER DATE"]),
+    ("Receipt No", ["Receipt No", "RECEIPT NO", "RECEIPTNO", "Receipt Number"]),
+    ("AGREEMENTNO", ["AGREEMENTNO", "AGREEMENT NO", "Agreement No"]),
+    ("PAYERNAME", ["PAYERNAME", "PAYER NAME"]),
+    ("AMOUNTPAID", ["AMOUNTPAID", "AMOUNT PAID"]),
+    ("COLLECTIONAGENTID", ["COLLECTIONAGENTID", "COLLECTION AGENT ID"]),
+    ("COLLECTIONAGENTNAME", ["COLLECTIONAGENTNAME", "COLLECTION AGENT NAME"]),
+    ("MODEOFPAYMENT", ["MODEOFPAYMENT", "MODE OF PAYMENT"]),
+    ("RECEIPTTYPE", ["RECEIPTTYPE", "RECEIPT TYPE"]),
+    ("BRANCH NAME", ["BRANCH NAME", "BRANCHNAME"]),
+    ("NEW AREA", ["NEW AREA", "AREA"]),
+    ("SUB REGION", ["SUB REGION", "Sub Region"]),
+    ("MAIN REGION", ["MAIN REGION", "Region"]),
+    ("Sub Zone", ["Sub Zone", "SUB ZONE"]),
+    ("ZONE NEW", ["ZONE NEW", "ZONE", "Zone"]),
+    ("SLAB", ["SLAB", "Slab"]),
 ]
+DISPLAY_COLUMNS = ["PENDING DAYS"] + [c for c, _ in OUTPUT_COLUMNS]
 
 
-def _fix_excel_dates(df: pd.DataFrame) -> pd.DataFrame:
+def _normalize(name: str) -> str:
+    return re.sub(r"\s+", " ", str(name).strip()).upper()
+
+
+def _find_col(df: pd.DataFrame, *candidates: str) -> str | None:
+    """Case/whitespace-insensitive column lookup, with a loose contains-match fallback."""
+    norm_map = {_normalize(c): c for c in df.columns}
+    for cand in candidates:
+        key = _normalize(cand)
+        if key in norm_map:
+            return norm_map[key]
+    for cand in candidates:
+        key = _normalize(cand)
+        for norm, orig in norm_map.items():
+            if key in norm or norm in key:
+                return orig
+    return None
+
+
+def _parse_dates(series: pd.Series) -> pd.Series:
     """
-    pyxlsb (unlike openpyxl) returns Excel date cells as raw serial numbers,
-    not datetimes. Convert the known date columns so downstream date-math
-    behaves correctly.
+    Converts a column that may be Excel serial numbers (what pyxlsb
+    gives us for date cells) and/or date text (e.g. "03-Jul-26") into
+    real dates, normalized to midnight. Numeric values win when
+    present; text is parsed with dayfirst=True as a fallback for any
+    cell that isn't numeric.
     """
-    for col in EXCEL_DATE_COLUMNS:
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], unit="D", origin="1899-12-30", errors="coerce")
+    numeric = pd.to_numeric(series, errors="coerce")
+    from_serial = pd.to_datetime(numeric, unit="D", origin="1899-12-30", errors="coerce")
+    from_text = pd.to_datetime(series, errors="coerce", dayfirst=True)
+    result = from_serial.where(numeric.notna(), from_text)
+    return result.dt.normalize()
+
+
+def load_dcr_raw(file) -> pd.DataFrame:
+    """Reads Sheet1 of the uploaded DCR .xlsb, exactly as-is (no ETL transforms)."""
+    df = pd.read_excel(file, sheet_name="Sheet1", engine="pyxlsb")
+    df.columns = [str(c).strip() for c in df.columns]
     return df
 
 
-def tat_bucket(days):
-    """Replicates the approximate-match VLOOKUP against Sheet3!A:B."""
-    if pd.isna(days):
-        return None
-    if days < 5:
-        return "Less then 4"
-    if days < 11:
-        return "5 TO 10"
-    return "Great then 10"
-
-
-# ---------------------------------------------------------------------------
-# Loaders — one per source file
-# ---------------------------------------------------------------------------
-def load_dcr(file) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """DCR.xlsb -> (raw receipts [Sheet1], agreement slab master [Sheet2])."""
-    receipts = pd.read_excel(file, sheet_name="Sheet1", engine="pyxlsb")
-    receipts = _fix_excel_dates(receipts)
-    master = pd.read_excel(file, sheet_name="Sheet2", engine="pyxlsb", usecols=[0, 1, 2, 3])
-    master.columns = ["AGREEMENTNO", "OPENING_DPD", "OPNG_SLAB_TYPE", "OPENING_SLAB"]
-    master = master.dropna(subset=["AGREEMENTNO"]).drop_duplicates("AGREEMENTNO", keep="last")
-    return receipts, master
-
-
-def load_disable_lists(file) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """To_be_Disabled.xlsb -> (cif_level_disable, agreement_level_disable)."""
-    cif = pd.read_excel(file, sheet_name="CIF Level Disable", engine="pyxlsb", usecols=[0, 15])
-    cif.columns = ["CIF_NO", "Status"]
-    cif = cif.dropna(subset=["CIF_NO"])
-    agr = pd.read_excel(file, sheet_name="Agreement Level Disble", engine="pyxlsb", usecols=[0, 5])
-    agr.columns = ["AGREEMENTNO", "Status"]
-    agr = agr.dropna(subset=["AGREEMENTNO"])
-    return cif, agr
-
-
-def load_employee_mobiles(file) -> set[str]:
-    """CIFCL_CBSL_List.xlsx -> set of employee/agent mobile numbers (as strings)."""
-    emp = pd.read_excel(file, sheet_name=0, usecols=["Mobile Number"])
-    nums = emp["Mobile Number"].dropna().astype(str).str.replace(r"\.0$", "", regex=True)
-    return set(nums)
-
-
-def load_prior_lookup_master(file) -> pd.DataFrame:
+def filter_mode_exceeding(df: pd.DataFrame, mode: str) -> tuple[pd.DataFrame, dict]:
     """
-    Pull forward the cumulative AGREEMENTNO -> CIF_NO/Zone/Sub Region/Slab
-    table from a previous DHC_Working.xlsx's 'Look Up' sheet (cols J:N).
-    This is the carried-forward state — see ROADMAP.md Open Question #1.
+    Filters df to the selected payment mode and "Updation Pending" status, 
+    computes PENDING DAYS, and returns only rows exceeding that mode's TAT 
+    — sorted worst (most overdue) first.
     """
-    df = pd.read_excel(file, sheet_name="Look Up", usecols="J:N", engine="openpyxl")
-    df.columns = ["AGREEMENTNO", "CIF_NO", "ZONE_NEW", "SUB_REGION", "OPENING_SLAB"]
-    return df.dropna(subset=["AGREEMENTNO"]).drop_duplicates("AGREEMENTNO", keep="last")
+    mop_col = _find_col(df, "MODEOFPAYMENT", "MODE OF PAYMENT")
+    if mop_col is None:
+        raise ValueError("Couldn't find a MODEOFPAYMENT column in this file.")
+        
+    receipt_enter_col = _find_col(df, "RECEIPT ENTER DATE")
+    if receipt_enter_col is None:
+        raise ValueError("Couldn't find a RECEIPT ENTER DATE column in this file.")
+
+    # Locate the Receipt Status column dynamically
+    status_col = _find_col(df, "RECEIPT STATUS", "RECEIPTSTATUS", "STATUS")
+    if status_col is None:
+        raise ValueError("Couldn't find a RECEIPT STATUS column in this file.")
+
+    # "Date" is always column A in this file — the report date
+    date_col = df.columns[0]
+    if _normalize(date_col) != "DATE":
+        found = _find_col(df, "Date")
+        if found is not None:
+            date_col = found
+
+    # 1. Filter by Payment Mode
+    match_values = [v.upper() for v in MODE_MATCH[mode]]
+    mode_mask = df[mop_col].astype(str).str.strip().str.upper().isin(match_values)
+    
+    # 2. Filter strictly by "Updation Pending"
+    status_mask = df[status_col].astype(str).str.strip().str.upper() == "UPDATION PENDING"
+    
+    # Combine both rules
+    sub = df.loc[mode_mask & status_mask].copy()
+    total_matched = int(len(sub))
+
+    receipt_norm = _parse_dates(sub[receipt_enter_col])
+    present_norm = _parse_dates(sub[date_col])
+    present_source = f'the "{date_col}" column (report date)'
+
+    # Drop rows where either date failed to parse
+    valid = receipt_norm.notna() & present_norm.notna()
+    unparseable = int((~valid).sum())
+    sub = sub.loc[valid].copy()
+    receipt_norm = receipt_norm.loc[valid]
+    present_norm = present_norm.loc[valid]
+
+    sub["_PENDING_DAYS"] = (present_norm - receipt_norm).dt.days
+    sub[receipt_enter_col] = receipt_norm  # normalized, for clean display below
+
+    threshold = MODE_TAT[mode]
+    exceeding = sub[sub["_PENDING_DAYS"] > threshold].copy()
+    exceeding = exceeding.sort_values(["_PENDING_DAYS", receipt_enter_col], ascending=[False, True])
+
+    missing: list[str] = []
+    out = pd.DataFrame(index=exceeding.index)
+    out["PENDING DAYS"] = exceeding["_PENDING_DAYS"].astype(int)
+    for display_name, candidates in OUTPUT_COLUMNS:
+        col = _find_col(df, *candidates)
+        if col is None:
+            missing.append(display_name)
+            out[display_name] = "N/A"
+        else:
+            out[display_name] = exceeding[col]
+
+    out["RECEIPT ENTER DATE"] = pd.to_datetime(out["RECEIPT ENTER DATE"], errors="coerce").dt.strftime("%d-%b-%y")
+    out = out.reset_index(drop=True)
+
+    meta = {
+        "mode": mode,
+        "threshold": threshold,
+        "present_source": present_source,
+        "missing_columns": missing,
+        "total_matched": total_matched,
+        "total_exceeding": int(len(out)),
+        "unparseable_dates": unparseable,
+    }
+    return out, meta
 
 
-# ---------------------------------------------------------------------------
-# Transform — build the working tabs
-# ---------------------------------------------------------------------------
-def build_lookup_master(prior_master: pd.DataFrame, dcr_master: pd.DataFrame) -> pd.DataFrame:
-    """
-    Refresh the cumulative agreement master: keep CIF_NO/Zone/Sub Region for
-    agreements already known, refresh Opening Slab for everyone from this
-    month's DCR Sheet2, and add new agreements with CIF/Zone/Sub Region
-    left blank (flagged for manual completion — they aren't derivable from
-    any of the 4 input files).
-    """
-    merged = dcr_master.merge(
-        prior_master[["AGREEMENTNO", "CIF_NO", "ZONE_NEW", "SUB_REGION"]],
-        on="AGREEMENTNO", how="left",
-    )
-    merged = merged.rename(columns={"OPNG_SLAB_TYPE": "OPENING_SLAB_LABEL"})
-    merged["NEEDS_CIF_MAPPING"] = merged["CIF_NO"].isna()
-    return merged[
-        ["AGREEMENTNO", "CIF_NO", "ZONE_NEW", "SUB_REGION",
-         "OPENING_SLAB_LABEL", "OPENING_SLAB", "NEEDS_CIF_MAPPING"]
-    ]
-
-
-def build_dcr_tab(
-    receipts: pd.DataFrame,
-    lookup_master: pd.DataFrame,
-    agr_disable: pd.DataFrame,
-    cif_disable: pd.DataFrame,
-    employee_mobiles: set[str],
-) -> pd.DataFrame:
-    """Replicates DCR tab columns 74-84 (the 11 derived/lookup columns)."""
-    df = receipts.copy()
-
-    df = df.merge(
-        lookup_master[["AGREEMENTNO", "CIF_NO", "OPENING_SLAB_LABEL", "NEEDS_CIF_MAPPING"]],
-        on="AGREEMENTNO", how="left",
-    )
-    df["CIF"] = df["CIF_NO"]
-
-    df["Unique Mob number"] = df.groupby("MOBILENO")["MOBILENO"].transform("count")
-    df["Mob Num VS Emp Mob Num"] = df["MOBILENO"].astype(str).str.replace(
-        r"\.0$", "", regex=True
-    ).isin(employee_mobiles)
-
-    df["Mode"] = df["MODEOFPAYMENT"].map(MODE_MAP)
-    df["Status"] = df["STATUS IN TAB"].map(STATUS_MAP)
-    df["Receipt Source"] = df["RECEIPTSOURCE"].map(RECEIPT_SOURCE_MAP)
-
-    # Zone / Sub Region: the raw DCR extract already carries these per-row
-    # (Sub Zone / SUB REGION columns) — no need for the CIF master here.
-    # NB: the pivot reports group by the granular "Sub Zone" field
-    # (EAST_1/EAST_2/NORTH_1.../SOUTH_1/SOUTH_2/WEST_1/WEST_2), not the
-    # broad 4-way "ZONE NEW" field — confirmed against the original
-    # workbook's row labels.
-    df["Zone"] = df["ZONE NEW"]
-    df["Sub Region"] = df["SUB REGION"]
-
-    # Slab: prefer this month's fresh Sheet2 value (OPNG SLAB/SLAB already
-    # in the raw extract); this matches the BT/BU formulas which re-pull
-    # from DCR.xlsb's own Sheet2 rather than the stale Look Up master.
-    df["Slab"] = df["SLAB"]
-
-    df = df.merge(
-        agr_disable.rename(columns={"Status": "Ag Level cash mode"}),
-        on="AGREEMENTNO", how="left",
-    )
-    df = df.merge(
-        cif_disable.rename(columns={"CIF_NO": "CIF", "Status": "CIF LEVEL"}),
-        on="CIF", how="left",
-    )
-    return df
-
-
-def build_rtgs_tab(dcr_tab: pd.DataFrame) -> pd.DataFrame:
-    """Filters to RTGS-mode receipts and computes Ageing / TAT / Receipt Type."""
-    rtgs = dcr_tab[dcr_tab["MODEOFPAYMENT"] == "RTGS"].copy()
-    rtgs["Ageing"] = (
-        pd.to_datetime(rtgs["RECEIPT ENTER DATE"]) - pd.to_datetime(rtgs["TXN DATE IN PL TAB"])
-    ).dt.days
-    rtgs["TAT"] = rtgs["Ageing"].apply(tat_bucket)
-    rtgs["Receipt Type"] = rtgs["RECEIPTTYPE"].map(RECEIPT_TYPE_MAP)
-    rtgs["Receipt Type"] = rtgs["Receipt Type"].fillna(
-        rtgs["RECEIPT CAT"].map(RECEIPT_TYPE_FALLBACK)
-    )
-    return rtgs
-
-
-# ---------------------------------------------------------------------------
-# Display constants for the pivot-style summary sheets
-# ---------------------------------------------------------------------------
-RECEIPT_TYPE_ORDER = ["OD", "Settlement", "Part Payment", "OTHER OD"]
-RECEIPT_TYPE_DISPLAY = {
-    "OD": "EMI OD/Charges",
-    "Settlement": "FORECLOSURE/SETTLEMENT",
-    "Part Payment": "PART PAYMENT",
-    "OTHER OD": "Other OD",
-}
-TAT_ORDER = ["Less then 4", "5 TO 10", "Great then 10"]
-TAT_DISPLAY = {"Less then 4": "< 4 Days", "5 TO 10": "5 - 10 Days", "Great then 10": "> 10 Days"}
-MODE_ORDER = ["AIRTEL / CASH", "CHQ / DD", "ONLINE_PAYMENT", "RTGS"]
-
-
-# ---------------------------------------------------------------------------
-# Summary sheet builders — each returns a plain-data structure (dicts/lists),
-# kept separate from Excel writing so the numbers can be unit-tested or
-# previewed in Streamlit without touching openpyxl.
-# ---------------------------------------------------------------------------
-def _tat_stats(df: pd.DataFrame, value_col: str = "AMOUNTPAID") -> dict:
-    out = {"by_bucket": {}, "total_count": 0, "total_value": 0.0}
-    for bucket in TAT_ORDER:
-        sub = df[df["TAT"] == bucket]
-        cnt = int(len(sub))
-        val = float(sub[value_col].sum()) / 1e7
-        out["by_bucket"][bucket] = {"count": cnt, "value": val}
-        out["total_count"] += cnt
-        out["total_value"] += val
-    return out
-
-
-def compute_zone_tat_matrix(df: pd.DataFrame, value_col: str = "AMOUNTPAID") -> dict:
-    """
-    Zone (Sub Zone) x Receipt Type x TAT bucket — the structure behind both
-    'RTGS Summary' and 'Delay in RCPTING Summary'. Zone here means the
-    granular 'Sub Zone' field (EAST_1, NORTH_2, SOUTH_1, ...), confirmed
-    against the original workbook's row labels.
-    """
-    g = df.dropna(subset=["Sub Zone", "TAT"]).copy()
-    zones = sorted(g["Sub Zone"].unique())
-    blocks = []
-    grand = _tat_stats(g.iloc[0:0], value_col)  # zeroed template
-    for zone in zones:
-        zdf = g[g["Sub Zone"] == zone]
-        subtotal = _tat_stats(zdf, value_col)
-        breakdown = [
-            (code, RECEIPT_TYPE_DISPLAY[code], _tat_stats(zdf[zdf["Receipt Type"] == code], value_col))
-            for code in RECEIPT_TYPE_ORDER
-        ]
-        blocks.append({"zone": zone, "subtotal": subtotal, "breakdown": breakdown})
-        for bucket in TAT_ORDER:
-            grand["by_bucket"][bucket]["count"] += subtotal["by_bucket"][bucket]["count"]
-            grand["by_bucket"][bucket]["value"] += subtotal["by_bucket"][bucket]["value"]
-        grand["total_count"] += subtotal["total_count"]
-        grand["total_value"] += subtotal["total_value"]
-    return {"zones": blocks, "grand_total": grand}
-
-
-def compute_online_receipt_source_block(df: pd.DataFrame) -> dict:
-    """Simple Receipt Source count among ONLINE_PAYMENT-mode rows."""
-    sub = df[df["Mode"] == "ONLINE_PAYMENT"]
-    counts = sub["RECEIPTSOURCE"].value_counts(dropna=True)
-    rows = [(name, int(cnt)) for name, cnt in counts.items()]
-    return {"rows": rows, "total": int(counts.sum())}
-
-
-def build_rtgs_summary(rtgs_tab: pd.DataFrame, dcr_tab: pd.DataFrame) -> dict:
-    """
-    The Zone x Receipt Type x TAT matrix comes from the RTGS-filtered tab.
-    The 'Online Payment — Receipt Source' mini-block is a secondary KPI on
-    the same dashboard and is computed from the full month's DCR data (it
-    would always be empty if computed from rtgs_tab, since Mode there is
-    always 'RTGS').
-    """
+def _mode_wording(mode: str) -> dict:
+    if mode == "Cash":
+        return {
+            "item": "Cash Payments",
+            "intro": (
+                "Please find the below mentioned Cash Payments that have been delayed in deposit "
+                "/uploading the seal challan in the system for more than one working day."
+            ),
+            "note1": (
+                "As per Audit Concerns, it is mandatory that any cash payment is deposited and the "
+                "corresponding seal challan is uploaded into the system within one working day, and "
+                "these cases will be sent to FCU by Operations for review, so please act on top priority"
+            ),
+        }
+    item = f"{mode} Payments"
     return {
-        "matrix": compute_zone_tat_matrix(rtgs_tab),
-        "online_source_block": compute_online_receipt_source_block(dcr_tab),
+        "item": item,
+        "intro": (
+            f"Please find the below mentioned {item} that have been delayed in deposit / updation "
+            "in the system for more than three working days."
+        ),
+        "note1": (
+            f"As per Audit Concerns, it is mandatory that any {mode.lower()} payment is deposited and "
+            "updated into the system within three working days, and these cases will be sent to FCU by "
+            "Operations for review, so please act on top priority"
+        ),
     }
 
 
-def build_delay_in_rcpting_summary(dcr_tab: pd.DataFrame) -> dict:
-    full = dcr_tab.copy()
-    full["Ageing"] = (
-        pd.to_datetime(full["RECEIPT ENTER DATE"]) - pd.to_datetime(full["TXN DATE IN PL TAB"])
-    ).dt.days
-    full["TAT"] = full["Ageing"].apply(tat_bucket)
-    full["Receipt Type"] = full["RECEIPTTYPE"].map(RECEIPT_TYPE_MAP)
-    full["Receipt Type"] = full["Receipt Type"].fillna(
-        full["RECEIPT CAT"].map(RECEIPT_TYPE_FALLBACK)
+NOTE2 = "Kindly ensure that we comply with this guideline moving forward to avoid any audit discrepancies."
+SIGNOFF = "Regards,\nShalini R\nLAP Collection Support \u2013 Chennai HO\n9600145482"
+
+
+def build_tat_mail_html(mode: str, exceeding_df: pd.DataFrame) -> tuple[str, str]:
+    e = html.escape
+    w = _mode_wording(mode)
+    subject = f"{w['item']} Delayed Beyond TAT \u2014 {datetime.now().strftime('%d-%b-%Y')}"
+
+    header_html = "".join(
+        f'<th style="padding:6px 10px;border:1px solid #d1d5db;background:#1e293b;'
+        f'color:#ffffff;font-size:12px;text-align:left;white-space:nowrap;">{e(c)}</th>'
+        for c in DISPLAY_COLUMNS
     )
-    return {
-        "matrix": compute_zone_tat_matrix(full),
-        "online_source_block": compute_online_receipt_source_block(full),
-    }
+    rows_html = ""
+    for i, (_, row) in enumerate(exceeding_df.iterrows()):
+        bg = "#ffffff" if i % 2 == 0 else "#f3f4f6"
+        cells = "".join(
+            f'<td style="padding:5px 10px;border:1px solid #e5e7eb;font-size:12px;'
+            f'color:#111827;white-space:nowrap;">{e(str(row[c]))}</td>'
+            for c in DISPLAY_COLUMNS
+        )
+        rows_html += f'<tr style="background:{bg};">{cells}</tr>'
 
-
-def _status_table(df: pd.DataFrame, status_groups: list[str], status_cols: list[str]) -> dict:
-    """
-    RECEIPT STATUS (row group) x Mode (row) x Status (column) counts,
-    used for both halves of 'Receipt made summary'.
-    """
-    groups = []
-    grand = {c: 0 for c in status_cols}
-    grand_total = 0
-    for status in status_groups:
-        sdf = df[df["RECEIPT STATUS"] == status]
-        if sdf.empty:
-            continue
-        modes = [m for m in MODE_ORDER if m in sdf["Mode"].unique()]
-        rows = []
-        group_totals = {c: 0 for c in status_cols}
-        for mode in modes:
-            mdf = sdf[sdf["Mode"] == mode]
-            counts = {c: int((mdf["Status"] == c).sum()) for c in status_cols}
-            row_total = sum(counts.values())
-            rows.append({"mode": mode, "counts": counts, "total": row_total})
-            for c in status_cols:
-                group_totals[c] += counts[c]
-                grand[c] += counts[c]
-            grand_total += row_total
-        groups.append({"status": status, "rows": rows, "totals": group_totals})
-    return {"groups": groups, "grand_totals": grand, "grand_total": grand_total}
-
-
-def build_receipt_made_summary(dcr_tab: pd.DataFrame) -> dict:
-    """
-    Two side-by-side tables, both grouped from the same RECEIPT STATUS field:
-    left = Updated/Pending x (Cleared, Deposited, Pending);
-    right = Updated/Bounced-or-Cancelled x (Cleared, Deposited, Bounced, Cxn).
-    """
-    status_relabel = {
-        "Updated": "UPDATED",
-        "Updation Pending": "PENDING",
-        "Bounced-or-Cancelled": "BOUNCED/CANCELLED",
-    }
-    d = dcr_tab.copy()
-    d["RECEIPT STATUS"] = d["RECEIPT STATUS"].map(status_relabel).fillna(d["RECEIPT STATUS"])
-    left = _status_table(d, ["UPDATED", "PENDING"], ["Cleared", "Deposit", "Pending"])
-    right = _status_table(d, ["UPDATED", "BOUNCED/CANCELLED"], ["Cleared", "Deposit", "Bounced", "Cxn"])
-    return {"left": left, "right": right}
-
-
-def build_cash_mode_validation_summary(dcr_tab: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compliance check: customers flagged on either disable list who still
-    paid in cash/Airtel, broken out by CIF and by day.
-    """
-    flagged = dcr_tab[
-        (dcr_tab["Mode"] == "AIRTEL / CASH")
-        & (dcr_tab["Ag Level cash mode"].notna() | dcr_tab["CIF LEVEL"].notna())
-    ].copy()
-    cols = ["CIF", "Zone2", "Sub Region2", "Slab", "Grand Total"]
-    if flagged.empty:
-        return pd.DataFrame(columns=cols)
-    flagged["Receipt Date"] = pd.to_datetime(flagged["RECEIPT ENTER DATE"]).dt.normalize()
-    pivot = pd.pivot_table(
-        flagged, index=["CIF", "Zone", "Sub Region", "Slab"],
-        columns="Receipt Date", values="AMOUNTPAID", aggfunc="sum",
+    table_html = (
+        '<table cellspacing="0" cellpadding="0" style="border-collapse:collapse;'
+        f'font-family:Segoe UI,Arial,sans-serif;"><tr>{header_html}</tr>{rows_html}</table>'
     )
-    pivot["Grand Total"] = pivot.sum(axis=1, skipna=True)
-    pivot = pivot.reset_index().rename(columns={"Zone": "Zone2", "Sub Region": "Sub Region2"})
-    return pivot
 
-
-def build_rcpt_cxn(dcr_tab: pd.DataFrame) -> pd.DataFrame:
+    body = f"""
+    <div style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#111827;line-height:1.6;">
+      <p>Dear Team,</p>
+      <p>{e(w['intro'])}</p>
+      <p>Note: {e(w['note1'])}<br/>{e(NOTE2)}</p>
+      {table_html}
+      <p style="margin-top:20px;">{e(SIGNOFF).replace(chr(10), '<br/>')}</p>
+    </div>
     """
-    Cancelled-receipt register. Structural columns are auto-filled; the
-    'Remarks' column is left blank for mam to fill in — this sheet is a
-    judgment log, not a formula output (see ROADMAP.md).
-    """
-    cxn = dcr_tab[dcr_tab["Status"] == "Cxn"].copy()
-    out = pd.DataFrame({
-        "ReceiptNo": cxn.get("Receipt No"),
-        "ReceiptDate": pd.to_datetime(cxn["RECEIPT ENTER DATE"]).dt.strftime("%d/%m/%Y"),
-        "Amount": cxn["AMOUNTPAID"],
-        "ReceiptStatus": "Cancelled",
-        "ReceiptType": cxn.get("Receipt Type", cxn.get("RECEIPTTYPE")),
-        "PaymentMode": cxn["Mode"],
-        "Zone": cxn["Zone"],
-        "AgreementNo": cxn["AGREEMENTNO"],
-        "CustomerName": cxn.get("PAYERNAME"),
-        "ReceiptCreatedDate": pd.to_datetime(cxn["RECEIPT ENTER DATE"]).dt.strftime("%d/%m/%Y"),
-        "Status": "Duplicate Receipt",
-        "Remarks": "",
-    })
-    return out
+    return subject, body
 
 
-def _stats_row(label: str, stats: dict) -> list:
-    """Helper to flatten a stats dict into a row for preview DataFrame."""
-    row = [label]
-    for bucket in TAT_ORDER:
-        row += [stats["by_bucket"][bucket]["count"], round(stats["by_bucket"][bucket]["value"], 2)]
-    row += [stats["total_count"], round(stats["total_value"], 2)]
-    return row
+def build_tat_mail_text(mode: str, exceeding_df: pd.DataFrame, max_rows: int = 20) -> tuple[str, str]:
+    w = _mode_wording(mode)
+    subject = f"{w['item']} Delayed Beyond TAT \u2014 {datetime.now().strftime('%d-%b-%Y')}"
+
+    lines = ["Dear Team,", "", w["intro"], "", f"Note: {w['note1']}", NOTE2, ""]
+    shown = exceeding_df.head(max_rows)
+    for _, row in shown.iterrows():
+        lines.append(
+            f"- {row['Receipt No']} | {row['RECEIPT ENTER DATE']} | Pending {row['PENDING DAYS']}d | "
+            f"{row['PAYERNAME']} | Rs {row['AMOUNTPAID']}"
+        )
+    if len(exceeding_df) > max_rows:
+        lines.append(f"... and {len(exceeding_df) - max_rows} more (use 'Compose in Outlook' for the full list).")
+    lines += ["", SIGNOFF]
+    return subject, "\n".join(lines)
 
 
-def zone_tat_matrix_to_dataframe(matrix: dict) -> pd.DataFrame:
-    """Flattens the Zone x Receipt Type x TAT structure into a preview-friendly DataFrame."""
-    cols = ["Zone / Receipt Type"]
-    for bucket in TAT_ORDER:
-        cols += [f"{TAT_DISPLAY[bucket]} Count", f"{TAT_DISPLAY[bucket]} Value"]
-    cols += ["Total Count", "Total Value (Cr)"]
-    rows = []
-    for block in matrix["zones"]:
-        rows.append(_stats_row(block["zone"], block["subtotal"]))
-        for code, label, stats in block["breakdown"]:
-            rows.append(_stats_row(f"   {label}", stats))
-    rows.append(_stats_row("GRAND TOTAL", matrix["grand_total"]))
-    return pd.DataFrame(rows, columns=cols)
+def compose_outlook_mail_html(subject: str, html_body: str) -> None:
+    import pythoncom
+    import win32com.client as win32
 
-
-def receipt_made_table_to_dataframe(table: dict, status_cols: list[str]) -> pd.DataFrame:
-    """Flattens the receipt status x mode table into a preview DataFrame."""
-    cols = ["Status", "Mode"] + [c.upper() for c in status_cols] + ["Grand Total"]
-    rows = []
-    for group in table["groups"]:
-        for i, r in enumerate(group["rows"]):
-            label = group["status"] if i == 0 else ""
-            rows.append([label, r["mode"]] + [r["counts"][c] for c in status_cols] + [r["total"]])
-    rows.append(["GRAND TOTAL", ""] + [table["grand_totals"][c] for c in status_cols] + [table["grand_total"]])
-    return pd.DataFrame(rows, columns=cols)
-
-
-# ---------------------------------------------------------------------------
-NAVY = "1F3864"
-HEADER_FILL = PatternFill("solid", start_color="D9E1F2")
-SUBTOTAL_FILL = PatternFill("solid", start_color="BDD7EE")
-GRANDTOTAL_FILL = PatternFill("solid", start_color="2E5395")
-TITLE_FONT = Font(name="Calibri", bold=True, size=13, color=NAVY)
-HEADER_FONT = Font(name="Calibri", bold=True, size=10, color=NAVY)
-SUBTOTAL_FONT = Font(name="Calibri", bold=True, size=10)
-GRANDTOTAL_FONT = Font(name="Calibri", bold=True, size=10, color="FFFFFF")
-BODY_FONT = Font(name="Calibri", size=10)
-THIN = Side(style="thin", color="B7C5D9")
-BOX = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
-COUNT_FMT = '#,##0;-#,##0;"-"'
-VALUE_FMT = '#,##0.00;-#,##0.00;"-"'
-CENTER = Alignment(horizontal="center", vertical="center")
-LEFT_INDENT = Alignment(horizontal="left", indent=1)
-
-
-def _set(ws, row, col, value, font=BODY_FONT, fill=None, fmt=None, align=None, border=BOX):
-    c = ws.cell(row=row, column=col, value=value)
-    c.font = font
-    if fill:
-        c.fill = fill
-    if fmt:
-        c.number_format = fmt
-    if align:
-        c.alignment = align
-    if border:
-        c.border = border
-    return c
-
-
-def _write_df(ws, df: pd.DataFrame, start_row: int = 1):
-    for j, col in enumerate(df.columns, start=1):
-        col_label = col.strftime("%d-%b") if isinstance(col, pd.Timestamp) else str(col)
-        _set(ws, start_row, j, col_label, font=HEADER_FONT, fill=HEADER_FILL, align=CENTER)
-        width = max(10, min(28, len(col_label) + 2))
-        ws.column_dimensions[get_column_letter(j)].width = width
-    for i, row in enumerate(df.itertuples(index=False), start=start_row + 1):
-        for j, val in enumerate(row, start=1):
-            fmt = None
-            if isinstance(val, (np.integer,)):
-                val = int(val)
-                fmt = COUNT_FMT
-            elif isinstance(val, (np.floating, float)):
-                if pd.isna(val):
-                    val = None
-                else:
-                    val = float(val)
-                    fmt = VALUE_FMT
-            elif isinstance(val, pd.Timestamp):
-                val = val.to_pydatetime()
-                fmt = "dd-mmm-yyyy"
-            _set(ws, i, j, val, fmt=fmt)
-    ws.freeze_panes = ws.cell(row=start_row + 1, column=1).coordinate
-
-
-def _write_zone_tat_sheet(ws, title: str, summary: dict):
-    """Writes the merged-header Zone x Receipt Type x TAT pivot, with an
-    online-receipt-source mini block on the left, exactly mirroring the
-    layout found in the original 'RTGS Summary' / 'Delay in RCPTING
-    Summary' tabs."""
-    matrix = summary["matrix"]
-    source_block = summary["online_source_block"]
-
-    ws.merge_cells("A1:L1")
-    _set(ws, 1, 1, title, font=TITLE_FONT, fill=None, align=Alignment(horizontal="left"), border=None)
-
-    # --- online receipt source mini-block (cols A:B) ---
-    ws.merge_cells("A2:B2")
-    _set(ws, 2, 1, "Online Payment — Receipt Source", font=HEADER_FONT, fill=HEADER_FILL, align=CENTER)
-    _set(ws, 3, 1, "Source", font=HEADER_FONT, fill=HEADER_FILL, align=CENTER)
-    _set(ws, 3, 2, "Receipt Count", font=HEADER_FONT, fill=HEADER_FILL, align=CENTER)
-    r = 4
-    for name, cnt in source_block["rows"]:
-        _set(ws, r, 1, name, align=LEFT_INDENT)
-        _set(ws, r, 2, cnt, fmt=COUNT_FMT)
-        r += 1
-    _set(ws, r, 1, "GRAND TOTAL", font=SUBTOTAL_FONT, fill=SUBTOTAL_FILL)
-    _set(ws, r, 2, source_block["total"], font=SUBTOTAL_FONT, fill=SUBTOTAL_FILL, fmt=COUNT_FMT)
-
-    # --- main Zone x Receipt Type x TAT matrix (cols D:L) ---
-    ws.merge_cells("D2:D3")
-    _set(ws, 2, 4, "ZONE / RECEIPT TOWARDS", font=HEADER_FONT, fill=HEADER_FILL, align=CENTER)
-    col = 5
-    for bucket in TAT_ORDER:
-        ws.merge_cells(start_row=2, start_column=col, end_row=2, end_column=col + 1)
-        _set(ws, 2, col, TAT_DISPLAY[bucket], font=HEADER_FONT, fill=HEADER_FILL, align=CENTER)
-        _set(ws, 2, col + 1, None, fill=HEADER_FILL)
-        _set(ws, 3, col, "Count", font=HEADER_FONT, fill=HEADER_FILL, align=CENTER)
-        _set(ws, 3, col + 1, "Value (Cr)", font=HEADER_FONT, fill=HEADER_FILL, align=CENTER)
-        col += 2
-    ws.merge_cells("K2:K3")
-    ws.merge_cells("L2:L3")
-    _set(ws, 2, 11, "Total Count", font=HEADER_FONT, fill=HEADER_FILL, align=CENTER)
-    _set(ws, 2, 12, "Total Value (Cr)", font=HEADER_FONT, fill=HEADER_FILL, align=CENTER)
-
-    def _write_stat_row(row, label_col, label, stats, font, fill, indent=False):
-        align = LEFT_INDENT if indent else Alignment(horizontal="left")
-        _set(ws, row, label_col, label, font=font, fill=fill, align=align)
-        col = label_col + 1
-        for bucket in TAT_ORDER:
-            _set(ws, row, col, stats["by_bucket"][bucket]["count"], font=font, fill=fill, fmt=COUNT_FMT)
-            _set(ws, row, col + 1, stats["by_bucket"][bucket]["value"], font=font, fill=fill, fmt=VALUE_FMT)
-            col += 2
-        _set(ws, row, col, stats["total_count"], font=font, fill=fill, fmt=COUNT_FMT)
-        _set(ws, row, col + 1, stats["total_value"], font=font, fill=fill, fmt=VALUE_FMT)
-
-    row = 4
-    for block in matrix["zones"]:
-        _write_stat_row(row, 4, block["zone"], block["subtotal"], SUBTOTAL_FONT, SUBTOTAL_FILL)
-        row += 1
-        for code, display, stats in block["breakdown"]:
-            _write_stat_row(row, 4, display, stats, BODY_FONT, None, indent=True)
-            row += 1
-    _write_stat_row(row, 4, "GRAND TOTAL", matrix["grand_total"], GRANDTOTAL_FONT, GRANDTOTAL_FILL)
-
-    for letter, width in zip("ABCDEFGHIJKL", [20, 14, 3, 26, 9, 12, 9, 12, 9, 12, 12, 14]):
-        ws.column_dimensions[letter].width = width
-    ws.freeze_panes = "E4"
-
-
-def _write_receipt_made_summary_sheet(ws, summary: dict):
-    def _write_table(start_col, title, status_cols, table):
-        n = len(status_cols)
-        last_col = start_col + 2 + n  # label cols (2) + status cols (n) + grand total (1)
-        from openpyxl.utils import get_column_letter as gcl
-        ws.merge_cells(start_row=1, start_column=start_col, end_row=1, end_column=last_col)
-        _set(ws, 1, start_col, title, font=TITLE_FONT, align=Alignment(horizontal="left"), border=None)
-        _set(ws, 2, start_col, "RECEIPT STATUS", font=HEADER_FONT, fill=HEADER_FILL, align=CENTER)
-        _set(ws, 2, start_col + 1, "PAYMENT MODE", font=HEADER_FONT, fill=HEADER_FILL, align=CENTER)
-        for k, c in enumerate(status_cols):
-            _set(ws, 2, start_col + 2 + k, c.upper(), font=HEADER_FONT, fill=HEADER_FILL, align=CENTER)
-        _set(ws, 2, last_col, "GRAND TOTAL", font=HEADER_FONT, fill=HEADER_FILL, align=CENTER)
-
-        row = 3
-        for group in table["groups"]:
-            first_row = row
-            for r in group["rows"]:
-                _set(ws, row, start_col, None)
-                _set(ws, row, start_col + 1, r["mode"], align=LEFT_INDENT)
-                for k, c in enumerate(status_cols):
-                    _set(ws, row, start_col + 2 + k, r["counts"][c], fmt=COUNT_FMT)
-                _set(ws, row, last_col, r["total"], font=SUBTOTAL_FONT, fmt=COUNT_FMT)
-                row += 1
-            if row > first_row:
-                _set(ws, first_row, start_col, group["status"], font=SUBTOTAL_FONT, align=Alignment(horizontal="left"))
-                if row - 1 > first_row:
-                    ws.merge_cells(start_row=first_row, start_column=start_col, end_row=row - 1, end_column=start_col)
-        _set(ws, row, start_col, "GRAND TOTAL", font=GRANDTOTAL_FONT, fill=GRANDTOTAL_FILL)
-        _set(ws, row, start_col + 1, None, fill=GRANDTOTAL_FILL)
-        for k, c in enumerate(status_cols):
-            _set(ws, row, start_col + 2 + k, table["grand_totals"][c], font=GRANDTOTAL_FONT, fill=GRANDTOTAL_FILL, fmt=COUNT_FMT)
-        _set(ws, row, last_col, table["grand_total"], font=GRANDTOTAL_FONT, fill=GRANDTOTAL_FILL, fmt=COUNT_FMT)
-        return last_col
-
-    last = _write_table(1, "Receipt Made Summary — Updated / Pending",
-                         ["Cleared", "Deposit", "Pending"], summary["left"])
-    _write_table(last + 2, "Receipt Made Summary — Updated / Bounced or Cancelled",
-                 ["Cleared", "Deposit", "Bounced", "Cxn"], summary["right"])
-
-    for letter, width in zip("ABCDEFGHIJKLMN", [20, 16, 11, 11, 11, 13, 3, 20, 16, 11, 11, 11, 11, 13]):
-        ws.column_dimensions[letter].width = width
-    ws.freeze_panes = "A3"
-
-
-def write_output_workbook(
-    rtgs_summary: dict,
-    delay_summary: dict,
-    receipt_made_summary: dict,
-    cash_mode_validation_summary: pd.DataFrame,
-    rcpt_cxn: pd.DataFrame,
-    extra_tabs: dict[str, pd.DataFrame] | None = None,
-) -> io.BytesIO:
-    wb = Workbook()
-    wb.remove(wb.active)
-
-    ws = wb.create_sheet("Receipt made summary")
-    _write_receipt_made_summary_sheet(ws, receipt_made_summary)
-
-    ws = wb.create_sheet("RTGS Summary")
-    _write_zone_tat_sheet(ws, "RTGS Summary", rtgs_summary)
-
-    ws = wb.create_sheet("Cash Mode Validat Summary")
-    _write_df(ws, cash_mode_validation_summary)
-
-    ws = wb.create_sheet("Delay in RCPTING Summary")
-    _write_zone_tat_sheet(ws, "Delay in RCPTING Summary", delay_summary)
-
-    ws = wb.create_sheet("RCPT CXN")
-    _write_df(ws, rcpt_cxn)
-
-    for name, df in (extra_tabs or {}).items():
-        ws = wb.create_sheet(name[:31])
-        _write_df(ws, df)
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    return buf
+    pythoncom.CoInitialize()
+    try:
+        outlook = win32.Dispatch("Outlook.Application")
+        mail = outlook.CreateItem(0)
+        mail.Subject = subject
+        mail.HTMLBody = html_body
+        mail.Display()
+    finally:
+        pythoncom.CoUninitialize()
