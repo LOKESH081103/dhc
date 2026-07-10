@@ -7,6 +7,7 @@ map and the open questions that need confirming with the process owner.
 """
 import html
 import io
+import re
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -2557,6 +2558,8 @@ def build_mail_summary(
     dcr_tab: pd.DataFrame,
     report_date: str | None = None,
     zone_label: str = "Overall",
+    chq_brs: dict | None = None,
+    air_brs: dict | None = None,
 ) -> tuple[str, str]:
     """
     Builds (subject, body) in the exact "Daily Health Check" format the
@@ -2565,6 +2568,14 @@ def build_mail_summary(
     summary dicts/DataFrames already in st.session_state, so the numbers
     always match the exported Excel files. See FILL_MANUALLY above for
     what still needs a human to fill in.
+
+    chq_brs / air_brs are the dicts from process_brs_for_mail (Cheque/DD
+    and Airtel Cash BRS respectively) — when supplied, they fill in the
+    Delay in Receipting / Deposition section for real instead of leaving
+    it as [Fill manually]. The Airtel Cash BRS file covers both the "Cash
+    Mode" and "Airtel Deposit" lines (there's no separate physical-cash
+    BRS — Airtel and Cash are reconciled together in one "Airtel Cash BRS"
+    report), so both pairs of lines share the same air_brs numbers.
 
     dcr_tab should already be filtered to the desired zone before calling
     this (see filter_by_broad_zone) — zone_label is just for the
@@ -2663,12 +2674,12 @@ def build_mail_summary(
         "",
         "Delay in Receipting / Deposition :-",
         "",
-        f"- Cash Mode – Delay in Deposition Count is {FILL_MANUALLY} (deposition date isn't tracked by this pipeline).",
-        f"- Cash Mode – Delay in Receipting Count is {FILL_MANUALLY}.",
-        f"- Airtel Deposit – Delay in Deposition Count is {FILL_MANUALLY}.",
-        f"- Airtel Deposit – Delay in Receipting Count is {FILL_MANUALLY}.",
-        f"- CHQ / DD – Delay in Deposition Count is {FILL_MANUALLY}.",
-        f"- CHQ / DD – Delay in Receipting Count is {FILL_MANUALLY}.",
+        f"- Cash Mode – Delay in Deposition Count is {air_brs['delay']['delay_deposition'] if air_brs else FILL_MANUALLY}.",
+        f"- Cash Mode – Delay in Receipting Count is {air_brs['delay']['delay_receipting'] if air_brs else FILL_MANUALLY}.",
+        f"- Airtel Deposit – Delay in Deposition Count is {air_brs['delay']['delay_deposition'] if air_brs else FILL_MANUALLY}.",
+        f"- Airtel Deposit – Delay in Receipting Count is {air_brs['delay']['delay_receipting'] if air_brs else FILL_MANUALLY}.",
+        f"- CHQ / DD – Delay in Deposition Count is {chq_brs['delay']['delay_deposition'] if chq_brs else FILL_MANUALLY}.",
+        f"- CHQ / DD – Delay in Receipting Count is {chq_brs['delay']['delay_receipting'] if chq_brs else FILL_MANUALLY}.",
         "",
         "Regards,",
     ])
@@ -2711,9 +2722,13 @@ def build_mail_html_summary(
     zone_overview_cid: str = "zone_overview",
     overview_cid: str = "receipts_overview",
     sync_cid: str = "receipt_sync_status",
+    chq_brs_cid: str = "chq_brs_status",
+    air_brs_cid: str = "air_brs_status",
     img_width: int = 560,
     report_date: str | None = None,
     zone_label: str = "Overall",
+    chq_brs: dict | None = None,
+    air_brs: dict | None = None,
 ) -> tuple[str, str]:
     """
     HTML counterpart of build_mail_summary — same "Daily Health Check"
@@ -2756,6 +2771,7 @@ def build_mail_html_summary(
     """
     subject, _ = build_mail_summary(
         receipt_made_summary, rtgs_summary, cash_mode_validation_df, delay_summary, rcpt_cxn_df, dcr_tab, report_date, zone_label,
+        chq_brs, air_brs,
     )
     date_str = report_date or datetime.now().strftime("%d-%b-%Y")
     try:
@@ -2899,14 +2915,16 @@ def build_mail_html_summary(
       <div style="{section}">
         <h3 style="{heading}">Delay in Receipting / Deposition :-</h3>
         <ul style="margin:0;padding-left:20px;">
-          <li>Cash Mode – Delay in Deposition Count is {fill} (deposition date isn't tracked by this pipeline).</li>
-          <li>Cash Mode – Delay in Receipting Count is {fill}.</li>
-          <li>Airtel Deposit – Delay in Deposition Count is {fill}.</li>
-          <li>Airtel Deposit – Delay in Receipting Count is {fill}.</li>
-          <li>CHQ / DD – Delay in Deposition Count is {fill}.</li>
-          <li>CHQ / DD – Delay in Receipting Count is {fill}.</li>
+          <li>Cash Mode – Delay in Deposition Count is <b>{air_brs['delay']['delay_deposition'] if air_brs else fill}</b>.</li>
+          <li>Cash Mode – Delay in Receipting Count is <b>{air_brs['delay']['delay_receipting'] if air_brs else fill}</b>.</li>
+          <li>Airtel Deposit – Delay in Deposition Count is <b>{air_brs['delay']['delay_deposition'] if air_brs else fill}</b>.</li>
+          <li>Airtel Deposit – Delay in Receipting Count is <b>{air_brs['delay']['delay_receipting'] if air_brs else fill}</b>.</li>
+          <li>CHQ / DD – Delay in Deposition Count is <b>{chq_brs['delay']['delay_deposition'] if chq_brs else fill}</b>.</li>
+          <li>CHQ / DD – Delay in Receipting Count is <b>{chq_brs['delay']['delay_receipting'] if chq_brs else fill}</b>.</li>
         </ul>
         {img_tag(delay_cid, "Delay in Recepting Summary")}
+        {img_tag(chq_brs_cid, "Cheque/DD BRS Status") if chq_brs else ""}
+        {img_tag(air_brs_cid, "Airtel Cash BRS Status") if air_brs else ""}
       </div>
 
       <p>Regards,</p>
@@ -3364,5 +3382,239 @@ def rcpt_cxn_to_excel_bytes(df: pd.DataFrame) -> io.BytesIO:
     _write_rcpt_cxn_sheet(ws, df)
     buf = io.BytesIO()
     wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+# ---------------------------------------------------------------------------
+# BRS Status (Bank Reconciliation Statement) — Cheque/DD and Airtel Cash.
+# Ported in from the standalone Collection Ops app so its "Delay in
+# Deposition" / "Delay in Receipting" counts can feed the Daily Health
+# Check mail directly, instead of leaving those two lines as
+# [Fill manually]. Two separate BRS MIS files feed this: one for Cheque/DD,
+# one for Airtel Cash — each uploaded and processed independently.
+# ---------------------------------------------------------------------------
+CHQ_TAT_BUCKETS = ["0-1", "2-4", "5-6", "Above 6"]
+AIR_TAT_BUCKETS = ["0-1", "2-3", "4-5", "Above 5"]
+OPS_BRS_ORDER = ["Credit Not Received", "Not Tally", "Tally"]
+CHQ_RECEIPT_ROWS = {
+    "Credit Not Received": ["Credit Not Received"],
+    "Not Tally": ["Waiting for Re-Credit", "Amount Mismatch", "Challan No Mismatch"],
+    "Tally": ["Delay in Deposition", "Delay in Receipting", "Nil Query"],
+}
+AIR_RECEIPT_ROWS = {
+    "Tally": ["Delay In Receipting", "Delay In Deposition", "Nil Query"],
+    "Credit Not Received": [],
+    "Not Tally": [],
+}
+
+
+def _aging_to_bucket_chq(aging) -> str:
+    try:
+        a = int(float(aging))
+    except (TypeError, ValueError):
+        return "0-1"
+    if a <= 1:
+        return "0-1"
+    elif a <= 4:
+        return "2-4"
+    elif a <= 6:
+        return "5-6"
+    return "Above 6"
+
+
+def _aging_to_bucket_air(aging) -> str:
+    try:
+        a = int(float(aging))
+    except (TypeError, ValueError):
+        return "0-1"
+    if a <= 1:
+        return "0-1"
+    elif a <= 3:
+        return "2-3"
+    elif a <= 5:
+        return "4-5"
+    return "Above 5"
+
+
+def _brs_normalize(name: str) -> str:
+    return re.sub(r"\s+", " ", str(name).strip()).upper()
+
+
+def _brs_find_col(df: pd.DataFrame, *candidates: str) -> str | None:
+    """Case/whitespace-insensitive column lookup, with a loose contains-match fallback."""
+    norm_map = {_brs_normalize(c): c for c in df.columns}
+    for cand in candidates:
+        key = _brs_normalize(cand)
+        if key in norm_map:
+            return norm_map[key]
+    for cand in candidates:
+        key = _brs_normalize(cand)
+        for norm, orig in norm_map.items():
+            if key in norm or norm in key:
+                return orig
+    return None
+
+
+def load_brs_raw(file) -> pd.DataFrame:
+    """Reads a BRS MIS .xlsx, stripping column whitespace."""
+    df = pd.read_excel(file)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def _brs_pivot(df: pd.DataFrame, bucket_fn, buckets: list[str]) -> tuple[dict, dict]:
+    """
+    Returns ({ ops_brs_status: { receipt_status: { bucket: count } } }, grand_totals_by_bucket).
+    Uses AGING for the bucket calculation.
+    """
+    ops_col = _brs_find_col(df, "OPS BRS STATUS", "OPS_BRS_STATUS")
+    tally_col = _brs_find_col(df, "RECEIPT STATUS\n(Tally)", "RECEIPT STAUS (Tally)", "RECEIPT STATUS (Tally)", "RECEIPT STATUS")
+    aging_col = _brs_find_col(df, "AGING", "Aging", "AGEING")
+    if not all([ops_col, tally_col, aging_col]):
+        raise ValueError(f"Missing required BRS columns. Found: ops={ops_col}, tally={tally_col}, aging={aging_col}")
+
+    d = df.copy()
+    d["_OPS"] = d[ops_col].astype(str).str.strip()
+    d["_TALLY"] = d[tally_col].astype(str).str.strip()
+    d["_BUCKET"] = d[aging_col].apply(bucket_fn)
+
+    result: dict = {}
+    for ops in d["_OPS"].unique():
+        sub = d[d["_OPS"] == ops]
+        result[ops] = {}
+        for tally in sub["_TALLY"].unique():
+            tsub = sub[sub["_TALLY"] == tally]
+            result[ops][tally] = {b: int((tsub["_BUCKET"] == b).sum()) for b in buckets}
+
+    grand = {b: int((d["_BUCKET"] == b).sum()) for b in buckets}
+    return result, grand
+
+
+def brs_delay_counts(pivot: dict) -> dict:
+    """
+    Pulls the two headline counts out of a BRS pivot: Delay in Deposition
+    and Delay in Receipting, both counted only within the "Tally" OPS BRS
+    group (that's where those receipt-status rows live) — case-insensitive
+    since Cheque/DD rows spell it "Delay in Deposition" and Airtel rows
+    spell it "Delay In Deposition".
+    """
+    tally = pivot.get("Tally", {})
+    deposition = receipting = 0
+    for receipt_status, buckets in tally.items():
+        label = receipt_status.strip().upper()
+        total = sum(buckets.values())
+        if label == "DELAY IN DEPOSITION":
+            deposition += total
+        elif label == "DELAY IN RECEIPTING":
+            receipting += total
+    return {"delay_deposition": deposition, "delay_receipting": receipting}
+
+
+def process_brs_for_mail(df: pd.DataFrame, mode: str) -> dict:
+    """
+    mode = "Cheque" or "Airtel". Returns pivot/grand/buckets/ops_rows/title
+    plus the two headline delay counts, ready to slot into the Daily
+    Health Check mail's "Delay in Receipting / Deposition" section.
+    """
+    if mode == "Cheque":
+        pivot, grand = _brs_pivot(df, _aging_to_bucket_chq, CHQ_TAT_BUCKETS)
+        buckets, ops_rows, title = CHQ_TAT_BUCKETS, CHQ_RECEIPT_ROWS, "CHEQUE/DD BRS Status"
+    else:
+        pivot, grand = _brs_pivot(df, _aging_to_bucket_air, AIR_TAT_BUCKETS)
+        buckets, ops_rows, title = AIR_TAT_BUCKETS, AIR_RECEIPT_ROWS, "Airtel Cash BRS Status"
+
+    return {
+        "pivot": pivot, "grand": grand, "buckets": buckets, "ops_rows": ops_rows,
+        "title": title, "mode": mode, "delay": brs_delay_counts(pivot),
+    }
+
+
+def brs_status_image_bytes(result: dict) -> io.BytesIO:
+    """
+    BRS Status dashboard PNG — same navy-header / KPI-card / horizontal-bar
+    visual language as the rest of the DHC mail images (deliberately not a
+    matplotlib bar+pie combo — that was hard to read and the labels
+    crowded each other on the TAT-bucket pie for small slices). Top: OPS
+    BRS Status totals (Credit Not Received / Not Tally / Tally) as KPI
+    cards. Below: two panels — the Tally group's receipt-status rows
+    (Delay in Deposition / Delay in Receipting / Nil Query) as proportion
+    bars, and the TAT bucket distribution as its own proportion bars —
+    laid out top-to-bottom with clear axis room so buckets like "2-4" and
+    "5-6" don't crowd each other the way the old pie chart did.
+    """
+    from PIL import Image, ImageDraw
+
+    navy = (13, 27, 51)
+    ops_colors = {"Credit Not Received": (192, 57, 43), "Not Tally": (230, 126, 34), "Tally": (39, 174, 96)}
+    bucket_colors = [(39, 174, 96), (243, 156, 18), (230, 126, 34), (192, 57, 43)]
+
+    pivot, grand, buckets, ops_rows, title = result["pivot"], result["grand"], result["buckets"], result["ops_rows"], result["title"]
+
+    ops_totals = {}
+    for ops in OPS_BRS_ORDER:
+        rows = ops_rows.get(ops) or list(pivot.get(ops, {}).keys())
+        ops_totals[ops] = sum(sum(pivot.get(ops, {}).get(r, {}).values()) for r in rows)
+    grand_total = sum(ops_totals.values()) or 1
+
+    tally_rows = [(r, sum(pivot.get("Tally", {}).get(r, {}).values())) for r in ops_rows.get("Tally", [])]
+    tally_rows = [(r, c) for r, c in tally_rows if c > 0] or tally_rows
+
+    width = 1000
+    pad = 40
+    header_h = 100
+    kpi_h = 90
+    gap = 22
+    row_h = 40
+    panel1_h = 50 + max(len(tally_rows), 1) * row_h + 20
+    panel2_h = 50 + len(buckets) * row_h + 20
+    height = header_h + gap + kpi_h + gap + panel1_h + gap + panel2_h + 50
+
+    base = Image.new("RGB", (width, height), (247, 248, 250))
+    draw = ImageDraw.Draw(base)
+
+    draw.rectangle([0, 0, width, header_h], fill=navy)
+    draw.text((pad, 24), title.upper(), font=_img_font(24), fill="white")
+    draw.text((pad, 62), f"{grand_total:,} receipts  ·  {datetime.now().strftime('%d-%b-%Y %H:%M')}", font=_img_font(12), fill=(190, 200, 220))
+
+    y = header_h + gap
+    kpi_gap = 16
+    kpi_w = (width - 2 * pad - kpi_gap * (len(OPS_BRS_ORDER) - 1)) // len(OPS_BRS_ORDER)
+    x = pad
+    for ops in OPS_BRS_ORDER:
+        color = ops_colors[ops]
+        draw.rounded_rectangle([x, y, x + kpi_w, y + kpi_h], radius=10, fill="white", outline=(225, 225, 230))
+        draw.rectangle([x, y, x + 5, y + kpi_h], fill=color)
+        draw.text((x + 16, y + 16), f"{ops_totals[ops]:,}", font=_img_font(22), fill=(30, 30, 30))
+        draw.text((x + 16, y + kpi_h - 26), ops.upper(), font=_img_font(10), fill=(120, 120, 120))
+        x += kpi_w + kpi_gap
+
+    y += kpi_h + gap
+
+    def panel(title_text, rows, colors, box_h):
+        draw.rounded_rectangle([pad, y, width - pad, y + box_h], radius=12, fill="white", outline=(225, 225, 230))
+        draw.text((pad + 20, y + 16), title_text, font=_img_font(13), fill=(70, 70, 70))
+        ry = y + 50
+        max_cnt = max((c for _, c in rows), default=1) or 1
+        for (label, cnt), color in zip(rows, colors):
+            draw.text((pad + 20, ry), str(label), font=_img_font(12), fill=(30, 30, 30))
+            bar_x0 = pad + 220
+            bar_max_w = width - pad - bar_x0 - 90
+            bar_w = int(bar_max_w * cnt / max_cnt) if max_cnt else 0
+            draw.rounded_rectangle([bar_x0, ry + 2, bar_x0 + bar_max_w, ry + 18], radius=6, fill=(232, 236, 241))
+            if bar_w > 0:
+                draw.rounded_rectangle([bar_x0, ry + 2, bar_x0 + bar_w, ry + 18], radius=6, fill=color)
+            draw.text((bar_x0 + bar_max_w + 12, ry + 2), f"{cnt:,}", font=_img_font(12), fill=(30, 30, 30))
+            ry += row_h
+
+    panel("TALLY — RECEIPT STATUS BREAKDOWN", tally_rows, [ops_colors["Tally"]] * len(tally_rows), panel1_h)
+    y += panel1_h + gap
+    bucket_rows = [(b, grand.get(b, 0)) for b in buckets]
+    panel("TAT BUCKET DISTRIBUTION (AGING, DAYS)", bucket_rows, bucket_colors, panel2_h)
+
+    draw.text((pad, height - 26), "Generated automatically — DHC Working Automation", font=_img_font(11), fill=(150, 150, 150))
+
+    buf = io.BytesIO()
+    base.save(buf, format="PNG")
     buf.seek(0)
     return buf
